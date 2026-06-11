@@ -1,0 +1,75 @@
+---
+- name: Destroy
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Service
+      community.aws.ecs_service:
+        name: minecraft
+        cluster: mc
+        state: absent
+        force_deletion: true
+      ignore_errors: true
+
+    - name: Tasks stopped
+      ansible.builtin.command:
+        cmd: aws ecs list-tasks --cluster mc --desired-status RUNNING --query 'length(taskArns)' --output text
+      register: running
+      until: running.stdout | trim | int == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    - name: Cluster
+      community.aws.ecs_cluster:
+        name: mc
+        state: absent
+      ignore_errors: true
+
+    - name: EFS id
+      ansible.builtin.command:
+        cmd: aws efs describe-file-systems --query "FileSystems[?Tags[?Key=='Name' && Value=='mcdata']].FileSystemId | [0]" --output text
+      register: efs_id
+      changed_when: false
+      failed_when: false
+
+    - name: Mount targets
+      ansible.builtin.command:
+        cmd: aws efs describe-mount-targets --file-system-id {{ efs_id.stdout | trim }} --query MountTargets[].MountTargetId --output text
+      register: mounts
+      changed_when: false
+      failed_when: false
+      when: efs_id.stdout | trim not in ['', 'None']
+
+    - name: Delete mounts
+      ansible.builtin.command:
+        cmd: aws efs delete-mount-target --mount-target-id {{ item }}
+      loop: "{{ mounts.stdout.split() }}"
+      when:
+        - efs_id.stdout | trim not in ['', 'None']
+        - mounts.stdout | trim | length > 0
+      ignore_errors: true
+
+    - name: mcdata
+      community.aws.efs:
+        name: mcdata
+        state: absent
+      ignore_errors: true
+
+    - name: efssg
+      amazon.aws.ec2_security_group:
+        name: efssg
+        state: absent
+      ignore_errors: true
+
+    - name: mcsg
+      amazon.aws.ec2_security_group:
+        name: mcsg
+        state: absent
+      ignore_errors: true
+
+    - name: IP file
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../.mc-public-ip"
+        state: absent

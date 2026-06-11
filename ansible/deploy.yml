@@ -1,0 +1,155 @@
+---
+- name: Deploy
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Default VPC
+      amazon.aws.ec2_vpc_net_info:
+        filters:
+          is-default: "true"
+      register: vpc
+
+    - name: Default subnet
+      amazon.aws.ec2_vpc_subnet_info:
+        filters:
+          vpc-id: "{{ vpc.vpcs[0].vpc_id }}"
+      register: subnets
+
+    - name: mcsg
+      amazon.aws.ec2_security_group:
+        name: mcsg
+        description: Minecraft ECS
+        vpc_id: "{{ vpc.vpcs[0].vpc_id }}"
+        rules:
+          - proto: tcp
+            ports: [25565]
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Project: 312-final
+      register: mcsg
+
+    - name: efssg
+      amazon.aws.ec2_security_group:
+        name: efssg
+        description: EFS
+        vpc_id: "{{ vpc.vpcs[0].vpc_id }}"
+        rules:
+          - proto: tcp
+            ports: [2049]
+            group_id: ["{{ mcsg.group_id }}"]
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Project: 312-final
+      register: efssg
+
+    - name: mcdata
+      community.aws.efs:
+        name: mcdata
+        tags:
+          Name: mcdata
+          Project: 312-final
+        targets:
+          - subnet_id: "{{ subnets.subnets[0].subnet_id }}"
+            security_groups: ["{{ efssg.group_id }}"]
+      register: mcdata
+
+    - name: EFS wait
+      ansible.builtin.pause:
+        seconds: 45
+      when: mcdata.changed
+
+    - name: Account ID
+      ansible.builtin.command:
+        cmd: aws sts get-caller-identity --query Account --output text
+      register: account
+      changed_when: false
+
+    - name: Cluster
+      community.aws.ecs_cluster:
+        name: mc
+        state: present
+
+    - name: Task definition
+      community.aws.ecs_taskdefinition:
+        family: minecraft
+        state: present
+        network_mode: awsvpc
+        launch_type: FARGATE
+        cpu: "1024"
+        memory: "2048"
+        execution_role_arn: "arn:aws:iam::{{ account.stdout | trim }}:role/LabRole"
+        volumes:
+          - name: minecraft-data
+            efsVolumeConfiguration:
+              fileSystemId: "{{ mcdata.efs.file_system_id }}"
+              transitEncryption: ENABLED
+        containers:
+          - name: minecraft
+            image: itzg/minecraft-server:latest
+            essential: true
+            portMappings:
+              - containerPort: 25565
+                hostPort: 25565
+                protocol: tcp
+            environment:
+              - { name: EULA, value: "TRUE" }
+              - { name: TYPE, value: VANILLA }
+              - { name: VERSION, value: "1.21.8" }
+              - { name: MEMORY, value: 1G }
+            mountPoints:
+              - sourceVolume: minecraft-data
+                containerPath: /data
+
+    - name: Service
+      community.aws.ecs_service:
+        name: minecraft
+        cluster: mc
+        state: present
+        task_definition: minecraft
+        desired_count: 1
+        launch_type: FARGATE
+        network_configuration:
+          subnets: ["{{ subnets.subnets[0].subnet_id }}"]
+          security_groups: ["{{ mcsg.group_id }}"]
+          assign_public_ip: true
+
+    - name: Stable
+      ansible.builtin.command:
+        cmd: aws ecs wait services-stable --cluster mc --services minecraft
+      changed_when: false
+
+    - name: Task ARN
+      ansible.builtin.command:
+        cmd: aws ecs list-tasks --cluster mc --service-name minecraft --desired-status RUNNING --query 'taskArns[0]' --output text
+      register: task
+      changed_when: false
+
+    - name: ENI
+      ansible.builtin.command:
+        cmd: >
+          aws ecs describe-tasks --cluster mc --tasks {{ task.stdout | trim }}
+          --query 'tasks[0].attachments[?type==`ElasticNetworkInterface`] | [0].details[?name==`networkInterfaceId`].value | [0]'
+          --output text
+      register: eni
+      changed_when: false
+
+    - name: Public IP
+      ansible.builtin.command:
+        cmd: aws ec2 describe-network-interfaces --network-interface-ids {{ eni.stdout | trim }} --query 'NetworkInterfaces[0].Association.PublicIp' --output text
+      register: ip
+      changed_when: false
+
+    - name: Save IP
+      ansible.builtin.copy:
+        content: "{{ ip.stdout | trim }}\n"
+        dest: "{{ playbook_dir }}/../.mc-public-ip"
+        mode: "0644"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "minecraft @ {{ ip.stdout | trim }}:25565"
